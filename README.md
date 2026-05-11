@@ -1,7 +1,3 @@
-# Nagarro — AWS Cloud Architect Interview Preparation
-
-> **Profile:** AWS Cloud Architect (10+ YoE) | **Topics:** Terraform, Docker, Kubernetes, EKS, AWS, Prometheus, Grafana
->
 > All questions are **scenario-based, senior/advanced level** — covering real-world situations, debugging, architecture decisions, and trade-offs.
 
 ---
@@ -19,6 +15,16 @@
   - [Q8 — Optimizing Slow Terraform Plan/Apply](#q8-optimizing-slow-terraform-planapply)
   - [Q9 — State Locking and Concurrent Access](#q9-state-locking-and-concurrent-access)
   - [Q10 — Multi-Account Multi-Region Provider Configuration](#q10-multi-account-multi-region-provider-configuration)
+  - [Q11 — Terraform taint vs replace — Forcing Recreation](#q11-terraform-taint-vs-replace--forcing-resource-recreation)
+  - [Q12 — Secrets Management — Handling Sensitive Variables](#q12-terraform-secrets-management--handling-sensitive-variables)
+  - [Q13 — Data Sources vs Resources](#q13-terraform-data-sources-vs-resource--when-to-use-which)
+  - [Q14 — Workspaces vs Directory-Based Separation](#q14-terraform-workspaces-vs-directory-based-environment-separation)
+  - [Q15 — Moved Blocks — Refactoring Without Destroying](#q15-terraform-moved-blocks--refactoring-without-destroying)
+  - [Q16 — Dynamic Blocks and Complex Variables](#q16-terraform-dynamic-blocks-and-complex-variable-structures)
+  - [Q17 — State Manipulation Commands](#q17-terraform-state-manipulation-commands)
+  - [Q18 — Conditional Logic and Expressions](#q18-terraform-conditional-logic-and-expressions)
+  - [Q19 — depends_on — Explicit vs Implicit Dependencies](#q19-terraform-depends_on--explicit-vs-implicit-dependencies)
+  - [Q20 — Providers — Pinning, Mirrors, and Custom Providers](#q20-terraform-providers--custom-providers-version-pinning-and-mirror-registries)
 - [Docker](#docker) *(coming soon)*
 - [Kubernetes](#kubernetes) *(coming soon)*
 - [EKS](#eks) *(coming soon)*
@@ -1773,6 +1779,1853 @@ module "vpc" {
 # Problem: "Conflicting provider version constraints"
 # Each module specifies its own provider requirements
 # Use required_providers block in modules to set constraints
+```
+
+---
+
+## Q11. Terraform `taint` vs `replace` — Forcing Resource Recreation
+
+### Question
+
+> A production EC2 instance is behaving strangely — the application is running but the instance's user-data script didn't execute properly during the last apply. You need to force Terraform to destroy and recreate this specific instance without affecting other resources. What are your options? Explain `taint`, `-replace`, and when to use each.
+
+### Real-Life Scenario
+
+You provisioned 5 EC2 instances using `for_each`. Instance `app-server-3` has a corrupted user-data — the CloudWatch agent never installed. The application works but you have no monitoring on that one instance. You need to recreate just this one instance without touching the other 4.
+
+### Answer
+
+#### Option 1: `terraform taint` (Legacy — Deprecated in Terraform 1.5+)
+
+```bash
+# Mark a specific resource as tainted
+terraform taint 'aws_instance.app["app-server-3"]'
+
+# Check what Terraform will do
+terraform plan
+# Output:
+# -/+ resource "aws_instance" "app["app-server-3"]" (tainted, will be replaced)
+
+# Apply — only app-server-3 gets recreated
+terraform apply
+```
+
+**Problem with `taint`:**
+- It modifies the state file immediately (even before apply)
+- If you change your mind, you need to `untaint`
+- It's a separate step — error-prone in CI/CD
+
+```bash
+# Undo a taint
+terraform untaint 'aws_instance.app["app-server-3"]'
+```
+
+#### Option 2: `-replace` Flag (Modern — Terraform 1.5+, Recommended)
+
+```bash
+# Plan with replacement — does NOT modify state
+terraform plan -replace='aws_instance.app["app-server-3"]'
+
+# Output:
+# -/+ resource "aws_instance" "app["app-server-3"]" (will be replaced)
+#     4 other instances: no changes
+
+# Apply with replacement
+terraform apply -replace='aws_instance.app["app-server-3"]'
+```
+
+**Why `-replace` is better:**
+- Does NOT modify state until apply runs
+- Atomic — plan and apply in one flow
+- Can be used in CI/CD safely
+- Can replace multiple resources in one command:
+
+```bash
+terraform apply \
+  -replace='aws_instance.app["app-server-3"]' \
+  -replace='aws_instance.app["app-server-5"]'
+```
+
+#### Option 3: `create_before_destroy` with `-replace`
+
+```hcl
+resource "aws_instance" "app" {
+  for_each      = var.app_servers
+  ami           = var.ami_id
+  instance_type = var.instance_type
+
+  lifecycle {
+    create_before_destroy = true   # New instance comes up before old one dies
+  }
+}
+```
+
+```bash
+terraform apply -replace='aws_instance.app["app-server-3"]'
+# Step 1: New app-server-3 created and healthy
+# Step 2: Old app-server-3 terminated
+# Result: Minimal downtime
+```
+
+#### Real-World: When to Force-Recreate
+
+| Scenario | Use `-replace`? | Alternative |
+|----------|----------------|-------------|
+| User-data didn't run | Yes | SSM Run Command to run script manually |
+| Instance in degraded state | Yes | AWS EC2 stop/start (keeps instance ID) |
+| AMI updated | No — change `ami` in `.tf` | Terraform will auto-replace |
+| EBS volume issue | `-replace` the volume | Snapshot + restore |
+| Security patch needed | No — use SSM Patch Manager | Immutable infra: new AMI + replace |
+
+#### Troubleshooting
+
+```bash
+# Problem: "Resource not found in state"
+terraform state list | grep app-server
+# Check the exact resource address — quotes and brackets matter
+
+# Problem: "Cannot replace a resource that doesn't exist"
+# The resource was already destroyed or never created
+terraform plan  # Check what exists
+
+# Problem: "Replacement would cause downtime"
+# Use create_before_destroy lifecycle + target group health checks
+# ELB will drain connections from old instance first
+```
+
+---
+
+## Q12. Terraform Secrets Management — Handling Sensitive Variables
+
+### Question
+
+> Your Terraform configuration needs database passwords, API keys, and SSL certificates. A junior engineer committed a `terraform.tfvars` file with plaintext passwords to Git. How do you remediate this, and what is the proper way to manage secrets in Terraform? Compare at least 4 approaches.
+
+### Real-Life Scenario
+
+You run `git log --all --full-history -- terraform.tfvars` and discover that `db_password = "Pr0duction!P@ss"` has been in the repo for 6 months. Even if you delete the file now, the password is in Git history. Meanwhile, the state file also contains the password in plaintext.
+
+### Answer
+
+#### Immediate Remediation
+
+```bash
+# Step 1: Rotate the compromised password IMMEDIATELY
+aws rds modify-db-instance \
+  --db-instance-identifier prod-main-db \
+  --master-user-password "NewSecureP@ssw0rd$(openssl rand -hex 8)" \
+  --apply-immediately
+
+# Step 2: Remove the file from Git history (BFG is faster than git filter-branch)
+# Install BFG: https://rtyley.github.io/bfg-repo-cleaner/
+java -jar bfg.jar --delete-files terraform.tfvars
+git reflog expire --expire=now --all
+git gc --prune=now --aggressive
+git push --force    # ⚠️ Coordinate with team first
+
+# Step 3: Add to .gitignore
+echo "*.tfvars" >> .gitignore
+echo "*.auto.tfvars" >> .gitignore
+git add .gitignore
+git commit -m "Prevent tfvars from being committed"
+
+# Step 4: Invalidate any API keys that were exposed
+# Rotate ALL secrets that were in that file
+```
+
+#### Approach 1: AWS Secrets Manager + Data Source (Recommended)
+
+```hcl
+# Store the secret in AWS Secrets Manager first:
+# aws secretsmanager create-secret --name prod/db/password --secret-string "MyS3cur3P@ss"
+
+data "aws_secretsmanager_secret_version" "db_password" {
+  secret_id = "prod/db/password"
+}
+
+resource "aws_db_instance" "production" {
+  identifier     = "prod-main-db"
+  engine         = "postgres"
+  instance_class = "db.r6g.xlarge"
+  username       = "admin"
+  password       = data.aws_secretsmanager_secret_version.db_password.secret_string
+
+  lifecycle {
+    ignore_changes = [password]   # Don't show password in plan output
+  }
+}
+```
+
+**Advantages:** Secrets are centralized, audited (CloudTrail), and rotatable.
+
+#### Approach 2: HashiCorp Vault Provider
+
+```hcl
+provider "vault" {
+  address = "https://vault.mycompany.com:8200"
+  # Auth via VAULT_TOKEN env var or AWS IAM auth
+}
+
+data "vault_generic_secret" "db" {
+  path = "secret/data/production/database"
+}
+
+resource "aws_db_instance" "production" {
+  username = data.vault_generic_secret.db.data["username"]
+  password = data.vault_generic_secret.db.data["password"]
+}
+```
+
+#### Approach 3: Environment Variables
+
+```bash
+# Set secrets as env vars (CI/CD pipeline or local)
+export TF_VAR_db_password="MyS3cur3P@ss"
+export TF_VAR_api_key="sk-live-abc123"
+
+# Terraform automatically reads TF_VAR_* variables
+terraform apply
+```
+
+```hcl
+# variables.tf
+variable "db_password" {
+  type      = string
+  sensitive = true    # Hides from plan output (Terraform 0.14+)
+}
+
+resource "aws_db_instance" "production" {
+  password = var.db_password
+}
+```
+
+```bash
+# Plan output shows:
+# ~ password = (sensitive value)
+# Never shows the actual password
+```
+
+#### Approach 4: SOPS (Mozilla) — Encrypted Files in Git
+
+```bash
+# Install SOPS
+brew install sops
+
+# Create encrypted tfvars
+sops --encrypt --kms "arn:aws:kms:ap-south-1:123456789:key/abc-123" \
+  secrets.tfvars.json > secrets.enc.tfvars.json
+
+# Decrypt at runtime
+sops --decrypt secrets.enc.tfvars.json > secrets.tfvars.json
+terraform apply -var-file=secrets.tfvars.json
+rm secrets.tfvars.json   # Clean up plaintext immediately
+```
+
+#### State File — The Hidden Danger
+
+```bash
+# Even with sensitive variables, the STATE FILE contains plaintext!
+terraform state show aws_db_instance.production
+# Output includes: password = "MyS3cur3P@ss"
+
+# MITIGATIONS:
+# 1. Encrypt state at rest (S3 SSE-KMS)
+# 2. Restrict state file access via IAM
+# 3. Use Terraform Cloud (state is encrypted and access-controlled)
+```
+
+```hcl
+# S3 backend with KMS encryption
+terraform {
+  backend "s3" {
+    bucket         = "mycompany-terraform-state"
+    key            = "prod/terraform.tfstate"
+    region         = "ap-south-1"
+    encrypt        = true
+    kms_key_id     = "arn:aws:kms:ap-south-1:123456789:key/abc-123"
+    dynamodb_table = "terraform-locks"
+  }
+}
+```
+
+#### Comparison Matrix
+
+| Approach | Security Level | Complexity | Rotation | Audit Trail | Cost |
+|----------|---------------|------------|----------|-------------|------|
+| AWS Secrets Manager | High | Low | Auto-rotation | CloudTrail | ~$0.40/secret/month |
+| HashiCorp Vault | Very High | High | Auto-rotation | Built-in | Self-hosted or $$$  |
+| Environment Variables | Medium | Low | Manual | None | Free |
+| SOPS | High | Medium | Manual | Git history | Free (KMS cost) |
+| Plaintext in tfvars | **NONE** | Low | Manual | None | Free (but costly when breached) |
+
+---
+
+## Q13. Terraform `data` Sources vs `resource` — When to Use Which
+
+### Question
+
+> A new engineer keeps creating `resource` blocks for things that already exist (like the default VPC, existing IAM policies, or Route53 hosted zones). Explain the difference between `data` sources and `resource` blocks. When should you use each? Show a scenario where using the wrong one causes a disaster.
+
+### Real-Life Scenario
+
+An engineer writes:
+
+```hcl
+resource "aws_iam_policy" "admin" {
+  name = "AdministratorAccess"
+  # ...
+}
+```
+
+`terraform apply` fails: "EntityAlreadyExists: A policy named AdministratorAccess already exists." They then try `terraform import`, and now Terraform manages AWS's built-in AdministratorAccess policy. Later, someone runs `terraform destroy` and it **deletes the AdministratorAccess policy from the entire AWS account**.
+
+### Answer
+
+#### The Fundamental Difference
+
+```
+resource = "I want Terraform to CREATE and MANAGE this"
+data     = "I want Terraform to READ an existing thing (that I don't manage)"
+```
+
+#### When to Use `data`
+
+```hcl
+# 1. AWS-managed policies (you didn't create these)
+data "aws_iam_policy" "admin" {
+  name = "AdministratorAccess"
+}
+# Use: data.aws_iam_policy.admin.arn
+
+# 2. Existing VPC (created by another team or another Terraform config)
+data "aws_vpc" "existing" {
+  filter {
+    name   = "tag:Name"
+    values = ["production-vpc"]
+  }
+}
+# Use: data.aws_vpc.existing.id
+
+# 3. Current AWS account info
+data "aws_caller_identity" "current" {}
+# Use: data.aws_caller_identity.current.account_id
+
+# 4. AMI lookup (find the latest Amazon Linux 2023)
+data "aws_ami" "amazon_linux" {
+  most_recent = true
+  owners      = ["amazon"]
+  filter {
+    name   = "name"
+    values = ["al2023-ami-*-x86_64"]
+  }
+}
+# Use: data.aws_ami.amazon_linux.id
+
+# 5. Availability zones
+data "aws_availability_zones" "available" {
+  state = "available"
+}
+# Use: data.aws_availability_zones.available.names
+
+# 6. Route53 zone (already exists, you just need the zone ID)
+data "aws_route53_zone" "main" {
+  name = "mycompany.com"
+}
+# Use: data.aws_route53_zone.main.zone_id
+```
+
+#### When to Use `resource`
+
+```hcl
+# 1. Something YOU create and want Terraform to manage its lifecycle
+resource "aws_iam_role" "app_role" {
+  name = "my-app-role"
+  # Terraform creates it, updates it, and can destroy it
+}
+
+# 2. New infrastructure
+resource "aws_vpc" "new" {
+  cidr_block = "10.0.0.0/16"
+}
+
+# 3. Custom IAM policies (not AWS-managed)
+resource "aws_iam_policy" "custom_s3_read" {
+  name = "custom-s3-read-only"
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect   = "Allow"
+      Action   = ["s3:GetObject", "s3:ListBucket"]
+      Resource = ["arn:aws:s3:::my-bucket", "arn:aws:s3:::my-bucket/*"]
+    }]
+  })
+}
+```
+
+#### The Disaster Scenario — Using Resource Instead of Data
+
+```hcl
+# ❌ WRONG — This imports and manages AWS's built-in policy
+resource "aws_iam_policy" "admin" {
+  name = "AdministratorAccess"
+}
+# If someone runs terraform destroy → ALL admin access in the account is gone!
+
+# ✅ CORRECT — Just read the existing policy
+data "aws_iam_policy" "admin" {
+  name = "AdministratorAccess"
+}
+
+resource "aws_iam_role_policy_attachment" "admin_attach" {
+  role       = aws_iam_role.admin_role.name
+  policy_arn = data.aws_iam_policy.admin.arn   # Read-only reference
+}
+```
+
+#### Common Pattern — Data Source for Cross-State References
+
+```hcl
+# Team A manages networking (separate state)
+# Team B needs the VPC ID and subnet IDs
+
+# Option 1: terraform_remote_state
+data "terraform_remote_state" "networking" {
+  backend = "s3"
+  config = {
+    bucket = "mycompany-terraform-state"
+    key    = "prod/networking/terraform.tfstate"
+    region = "ap-south-1"
+  }
+}
+
+resource "aws_instance" "app" {
+  subnet_id = data.terraform_remote_state.networking.outputs.private_subnet_ids[0]
+}
+
+# Option 2: AWS data sources (no state coupling)
+data "aws_subnets" "private" {
+  filter {
+    name   = "tag:Type"
+    values = ["private"]
+  }
+  filter {
+    name   = "vpc-id"
+    values = [data.aws_vpc.existing.id]
+  }
+}
+```
+
+#### Troubleshooting
+
+```bash
+# Problem: "No matching data source found"
+# Your filter/name doesn't match anything in AWS
+aws ec2 describe-vpcs --filters "Name=tag:Name,Values=production-vpc"
+# Verify the resource exists and the filter is correct
+
+# Problem: "Multiple data sources matched"
+# Add more specific filters or use most_recent = true (for AMIs)
+data "aws_ami" "latest" {
+  most_recent = true        # ← Takes the newest match
+  owners      = ["amazon"]
+  # ...
+}
+
+# Problem: Data source returns empty/wrong values
+terraform console
+> data.aws_vpc.existing
+# Inspect all attributes interactively
+```
+
+---
+
+## Q14. Terraform Workspaces vs Directory-Based Environment Separation
+
+### Question
+
+> Your team debates whether to use Terraform workspaces (`terraform workspace new prod`) or directory-based separation (`environments/prod/`, `environments/dev/`) for managing multiple environments. You need to present both approaches with pros, cons, and real-world failure cases. Which do you recommend for a team managing 15 microservices across 3 accounts?
+
+### Real-Life Scenario
+
+The current setup uses workspaces. An engineer runs `terraform workspace select prod` on their laptop, forgets they're in prod, makes a "test change," and applies it. Production goes down. Meanwhile, another team member runs `terraform plan` without checking which workspace they're in — the plan output doesn't clearly show they're looking at production.
+
+### Answer
+
+#### Terraform Workspaces — How They Work
+
+```bash
+# Create workspaces
+terraform workspace new dev
+terraform workspace new staging
+terraform workspace new prod
+
+# Switch workspace
+terraform workspace select prod
+
+# List workspaces
+terraform workspace list
+#   default
+#   dev
+#   staging
+# * prod          ← current
+
+# Check current workspace in code
+terraform.workspace   # Returns "prod"
+```
+
+```hcl
+# Using workspace name in configurations
+resource "aws_instance" "app" {
+  instance_type = terraform.workspace == "prod" ? "m5.xlarge" : "t3.medium"
+  tags = {
+    Environment = terraform.workspace
+  }
+}
+
+# Backend — each workspace gets a separate state file automatically
+terraform {
+  backend "s3" {
+    bucket = "mycompany-terraform-state"
+    key    = "app/terraform.tfstate"     # Workspaces add prefix automatically
+    region = "ap-south-1"
+  }
+}
+# State paths become:
+#   env:/dev/app/terraform.tfstate
+#   env:/staging/app/terraform.tfstate
+#   env:/prod/app/terraform.tfstate
+```
+
+#### Directory-Based Separation — How It Works
+
+```
+environments/
+├── dev/
+│   ├── main.tf
+│   ├── backend.tf          # key = "dev/app/terraform.tfstate"
+│   ├── terraform.tfvars    # instance_type = "t3.medium"
+│   └── provider.tf         # assume_role → dev account
+├── staging/
+│   ├── main.tf
+│   ├── backend.tf          # key = "staging/app/terraform.tfstate"
+│   ├── terraform.tfvars
+│   └── provider.tf
+└── prod/
+    ├── main.tf
+    ├── backend.tf          # key = "prod/app/terraform.tfstate"
+    ├── terraform.tfvars    # instance_type = "m5.xlarge"
+    └── provider.tf         # assume_role → prod account
+```
+
+```hcl
+# environments/prod/terraform.tfvars
+environment    = "prod"
+instance_type  = "m5.xlarge"
+instance_count = 5
+multi_az       = true
+
+# environments/dev/terraform.tfvars
+environment    = "dev"
+instance_type  = "t3.medium"
+instance_count = 1
+multi_az       = false
+```
+
+#### Comparison
+
+| Feature | Workspaces | Directory-Based |
+|---------|-----------|----------------|
+| State isolation | Automatic (same backend, prefixed keys) | Manual (different backend keys) |
+| Provider per env | Same provider config | Different provider per dir (different accounts) |
+| Variable per env | Conditional logic (`terraform.workspace == "prod"`) | Separate `.tfvars` files — explicit |
+| Risk of wrong env | **HIGH** — one wrong `workspace select` | **LOW** — you `cd` into the right folder |
+| Code duplication | None — single codebase | Some — `main.tf` repeated (use modules to reduce) |
+| PR visibility | Hard to see which env is affected | Clear — PR touches `environments/prod/` |
+| Multi-account | Difficult — same provider block | Natural — each dir has its own provider |
+| CI/CD | Complex — must pass workspace name | Simple — trigger per directory path |
+
+#### The Workspace Disaster — Why I Recommend Directories
+
+```bash
+# The accident that happens with workspaces:
+
+# Engineer thinks they're in dev:
+terraform workspace select dev
+# ... makes changes ...
+terraform apply   # ✅ dev updated
+
+# Next day, forgets to switch back:
+# (they're still in prod from yesterday)
+terraform apply   # ❌ APPLIED TO PROD!
+
+# With directories, this CAN'T happen:
+cd environments/dev
+terraform apply   # Only dev files here, dev backend, dev provider
+# There's no way to accidentally hit prod
+```
+
+#### My Recommendation for 15 Microservices, 3 Accounts
+
+**Use directory-based separation + shared modules:**
+
+```
+infrastructure/
+├── modules/
+│   ├── microservice/         # Shared module
+│   │   ├── main.tf
+│   │   ├── variables.tf
+│   │   └── outputs.tf
+│
+├── environments/
+│   ├── dev/
+│   │   └── microservice-order/
+│   │       ├── main.tf       # module "app" { source = "../../../modules/microservice" }
+│   │       ├── backend.tf
+│   │       └── terraform.tfvars
+│   ├── staging/
+│   │   └── microservice-order/
+│   └── prod/
+│       └── microservice-order/
+```
+
+```hcl
+# environments/prod/microservice-order/main.tf
+module "app" {
+  source = "../../../modules/microservice"
+
+  environment    = "prod"
+  instance_type  = "m5.xlarge"
+  instance_count = 5
+  # ...
+}
+```
+
+**Zero code duplication** in `main.tf` — all logic lives in the module. Each environment directory only has:
+1. Module call with env-specific variables
+2. Backend config (unique state path)
+3. Provider config (unique account)
+
+---
+
+## Q15. Terraform `moved` Blocks — Refactoring Without Destroying
+
+### Question
+
+> You need to refactor your Terraform codebase — renaming resources, moving resources into modules, and changing `count` to `for_each`. Each of these would normally cause Terraform to destroy and recreate resources. How do you use `moved` blocks to refactor safely? Show examples for each scenario.
+
+### Real-Life Scenario
+
+Your initial Terraform code was written by a junior engineer 2 years ago. Resources have names like `aws_instance.server1`, `aws_instance.server2`. You need to refactor to `aws_instance.app["web"]`, `aws_instance.app["api"]` using `for_each`. Without `moved` blocks, Terraform would destroy both instances and create new ones.
+
+### Answer
+
+#### Scenario 1: Renaming a Resource
+
+```hcl
+# BEFORE
+resource "aws_instance" "server1" {
+  ami           = "ami-abc123"
+  instance_type = "m5.xlarge"
+}
+
+# AFTER — renamed to something meaningful
+resource "aws_instance" "web_server" {
+  ami           = "ami-abc123"
+  instance_type = "m5.xlarge"
+}
+
+# Tell Terraform: "web_server IS server1, don't recreate it"
+moved {
+  from = aws_instance.server1
+  to   = aws_instance.web_server
+}
+```
+
+```bash
+terraform plan
+# Output:
+# aws_instance.server1 has moved to aws_instance.web_server
+# No changes. Your infrastructure matches the configuration.
+```
+
+#### Scenario 2: Moving Resources INTO a Module
+
+```hcl
+# BEFORE — flat resources in root
+resource "aws_vpc" "main" { ... }
+resource "aws_subnet" "private" { ... }
+resource "aws_nat_gateway" "main" { ... }
+
+# AFTER — moved into a module
+module "networking" {
+  source     = "./modules/networking"
+  cidr_block = "10.0.0.0/16"
+}
+
+# Tell Terraform about the moves
+moved {
+  from = aws_vpc.main
+  to   = module.networking.aws_vpc.main
+}
+moved {
+  from = aws_subnet.private
+  to   = module.networking.aws_subnet.private
+}
+moved {
+  from = aws_nat_gateway.main
+  to   = module.networking.aws_nat_gateway.main
+}
+```
+
+#### Scenario 3: Converting `count` to `for_each`
+
+```hcl
+# BEFORE — using count (fragile, index-based)
+resource "aws_instance" "app" {
+  count         = 3
+  ami           = "ami-abc123"
+  instance_type = "m5.large"
+  tags = {
+    Name = "app-${count.index}"
+  }
+}
+# State addresses: aws_instance.app[0], aws_instance.app[1], aws_instance.app[2]
+
+# AFTER — using for_each (stable, key-based)
+variable "app_servers" {
+  default = {
+    "web"  = { type = "m5.large" }
+    "api"  = { type = "m5.large" }
+    "worker" = { type = "m5.large" }
+  }
+}
+
+resource "aws_instance" "app" {
+  for_each      = var.app_servers
+  ami           = "ami-abc123"
+  instance_type = each.value.type
+  tags = {
+    Name = "app-${each.key}"
+  }
+}
+
+# Map old index-based addresses to new key-based addresses
+moved {
+  from = aws_instance.app[0]
+  to   = aws_instance.app["web"]
+}
+moved {
+  from = aws_instance.app[1]
+  to   = aws_instance.app["api"]
+}
+moved {
+  from = aws_instance.app[2]
+  to   = aws_instance.app["worker"]
+}
+```
+
+```bash
+terraform plan
+# Output:
+# aws_instance.app[0] has moved to aws_instance.app["web"]
+# aws_instance.app[1] has moved to aws_instance.app["api"]
+# aws_instance.app[2] has moved to aws_instance.app["worker"]
+# No changes.
+```
+
+#### Scenario 4: Moving Between Modules
+
+```hcl
+# Resource was in module.old_infra, now moving to module.new_infra
+moved {
+  from = module.old_infra.aws_s3_bucket.data
+  to   = module.new_infra.aws_s3_bucket.data
+}
+```
+
+#### Scenario 5: Renaming a Module Itself
+
+```hcl
+# BEFORE
+module "database" {
+  source = "./modules/rds"
+}
+
+# AFTER
+module "primary_database" {
+  source = "./modules/rds"
+}
+
+moved {
+  from = module.database
+  to   = module.primary_database
+}
+# ALL resources inside the module are moved automatically
+```
+
+#### When to Remove `moved` Blocks
+
+```hcl
+# moved blocks are safe to keep forever, but you can remove them after:
+# 1. All environments (dev, staging, prod) have been applied
+# 2. The state has been updated in all workspaces
+# 3. You're confident no one is running old code
+
+# Good practice: add a comment with removal date
+moved {
+  from = aws_instance.server1
+  to   = aws_instance.web_server
+  # Safe to remove after 2026-06-01 (all envs migrated)
+}
+```
+
+#### Troubleshooting
+
+```bash
+# Problem: "Moved object still exists"
+# You have both the old AND new resource defined
+# Remove the old resource block, keep only the new one + moved block
+
+# Problem: "Cannot move to an address that already exists"
+# The target resource already exists in state
+terraform state list | grep web_server
+# Remove the conflicting resource from state first:
+terraform state rm aws_instance.web_server
+
+# Problem: "Unsupported: moved blocks between different resource types"
+# You can't move aws_instance to aws_launch_template
+# moved only works within the same resource type
+```
+
+---
+
+## Q16. Terraform Dynamic Blocks and Complex Variable Structures
+
+### Question
+
+> You need to create 20 security groups, each with different numbers of ingress and egress rules. Some have 2 rules, some have 15. A junior engineer created 20 separate `resource` blocks with hardcoded rules. How would you refactor this using `dynamic` blocks, `for_each`, and complex variable types?
+
+### Real-Life Scenario
+
+Your security group Terraform file is 800 lines long. Every time someone needs a new rule, they copy-paste an entire block and modify IPs. This leads to merge conflicts, inconsistencies, and audit nightmares. You need a data-driven approach where security groups and their rules are defined in a single variable.
+
+### Answer
+
+#### Step 1: Design the Variable Structure
+
+```hcl
+# variables.tf
+variable "security_groups" {
+  type = map(object({
+    description = string
+    vpc_id      = string
+    ingress_rules = list(object({
+      description     = string
+      from_port       = number
+      to_port         = number
+      protocol        = string
+      cidr_blocks     = optional(list(string), [])
+      security_groups = optional(list(string), [])
+    }))
+    egress_rules = list(object({
+      description = string
+      from_port   = number
+      to_port     = number
+      protocol    = string
+      cidr_blocks = list(string)
+    }))
+    tags = optional(map(string), {})
+  }))
+}
+```
+
+#### Step 2: Define Rules as Data
+
+```hcl
+# terraform.tfvars
+security_groups = {
+  "web-alb" = {
+    description = "ALB Security Group"
+    vpc_id      = "vpc-0abc123"
+    ingress_rules = [
+      {
+        description = "HTTPS from internet"
+        from_port   = 443
+        to_port     = 443
+        protocol    = "tcp"
+        cidr_blocks = ["0.0.0.0/0"]
+      },
+      {
+        description = "HTTP from internet"
+        from_port   = 80
+        to_port     = 80
+        protocol    = "tcp"
+        cidr_blocks = ["0.0.0.0/0"]
+      }
+    ]
+    egress_rules = [
+      {
+        description = "All outbound"
+        from_port   = 0
+        to_port     = 0
+        protocol    = "-1"
+        cidr_blocks = ["0.0.0.0/0"]
+      }
+    ]
+    tags = { Tier = "public" }
+  }
+
+  "app-server" = {
+    description = "Application Server SG"
+    vpc_id      = "vpc-0abc123"
+    ingress_rules = [
+      {
+        description     = "From ALB on port 8080"
+        from_port       = 8080
+        to_port         = 8080
+        protocol        = "tcp"
+        cidr_blocks     = ["10.0.0.0/16"]
+      },
+      {
+        description = "SSH from bastion"
+        from_port   = 22
+        to_port     = 22
+        protocol    = "tcp"
+        cidr_blocks = ["10.0.1.0/24"]
+      }
+    ]
+    egress_rules = [
+      {
+        description = "All outbound"
+        from_port   = 0
+        to_port     = 0
+        protocol    = "-1"
+        cidr_blocks = ["0.0.0.0/0"]
+      }
+    ]
+    tags = { Tier = "private" }
+  }
+}
+```
+
+#### Step 3: Use `dynamic` Blocks with `for_each`
+
+```hcl
+# main.tf
+resource "aws_security_group" "this" {
+  for_each    = var.security_groups
+  name        = each.key
+  description = each.value.description
+  vpc_id      = each.value.vpc_id
+
+  dynamic "ingress" {
+    for_each = each.value.ingress_rules
+    content {
+      description     = ingress.value.description
+      from_port       = ingress.value.from_port
+      to_port         = ingress.value.to_port
+      protocol        = ingress.value.protocol
+      cidr_blocks     = ingress.value.cidr_blocks
+      security_groups = ingress.value.security_groups
+    }
+  }
+
+  dynamic "egress" {
+    for_each = each.value.egress_rules
+    content {
+      description = egress.value.description
+      from_port   = egress.value.from_port
+      to_port     = egress.value.to_port
+      protocol    = egress.value.protocol
+      cidr_blocks = egress.value.cidr_blocks
+    }
+  }
+
+  tags = merge(
+    { Name = each.key, ManagedBy = "terraform" },
+    each.value.tags
+  )
+}
+```
+
+#### Result
+
+```bash
+terraform plan
+# Output:
+# + aws_security_group.this["web-alb"]     — 2 ingress, 1 egress
+# + aws_security_group.this["app-server"]  — 2 ingress, 1 egress
+# ... 18 more security groups
+
+# Adding a new rule = add to the variable, NOT touch the resource code
+```
+
+#### Nested Dynamic Blocks (Advanced — e.g., S3 Lifecycle Rules)
+
+```hcl
+variable "s3_buckets" {
+  type = map(object({
+    lifecycle_rules = list(object({
+      id      = string
+      enabled = bool
+      prefix  = string
+      transitions = list(object({
+        days          = number
+        storage_class = string
+      }))
+      expiration_days = optional(number)
+    }))
+  }))
+}
+
+resource "aws_s3_bucket_lifecycle_configuration" "this" {
+  for_each = var.s3_buckets
+  bucket   = aws_s3_bucket.this[each.key].id
+
+  dynamic "rule" {
+    for_each = each.value.lifecycle_rules
+    content {
+      id     = rule.value.id
+      status = rule.value.enabled ? "Enabled" : "Disabled"
+
+      filter {
+        prefix = rule.value.prefix
+      }
+
+      dynamic "transition" {
+        for_each = rule.value.transitions
+        content {
+          days          = transition.value.days
+          storage_class = transition.value.storage_class
+        }
+      }
+
+      dynamic "expiration" {
+        for_each = rule.value.expiration_days != null ? [rule.value.expiration_days] : []
+        content {
+          days = expiration.value
+        }
+      }
+    }
+  }
+}
+```
+
+#### Troubleshooting
+
+```bash
+# Problem: "dynamic block iterator 'ingress' not expected here"
+# Wrong nesting or typo in the dynamic block name
+# The dynamic block name must match the resource's nested block name
+
+# Problem: "Inappropriate value for attribute: list of string required"
+# Type mismatch — check your variable type definition
+# Use terraform console to debug:
+terraform console
+> var.security_groups["web-alb"].ingress_rules[0].cidr_blocks
+
+# Problem: "Invalid for_each argument — must be a map or set of strings"
+# for_each on a resource needs a map or set, not a list
+# Convert list to map: { for idx, rule in var.rules : idx => rule }
+```
+
+---
+
+## Q17. Terraform State Manipulation Commands
+
+### Question
+
+> Your production Terraform state has become messy — resources were imported incorrectly, some resources exist in state but not in AWS (phantom resources), and you need to move resources between state files. Walk me through `terraform state mv`, `terraform state rm`, `terraform state pull/push`, and when to use each. Include a real disaster recovery scenario.
+
+### Real-Life Scenario
+
+During a team reorganization, the networking team's resources (VPC, subnets) need to be moved from the monolithic `app-infra` state file to a new `networking` state file. Meanwhile, 3 EC2 instances in the state were manually terminated via the Console — they no longer exist in AWS but Terraform still thinks they're there.
+
+### Answer
+
+#### Command Reference
+
+| Command | What It Does | When to Use |
+|---------|-------------|-------------|
+| `terraform state list` | List all resources in state | Always start here |
+| `terraform state show <resource>` | Show details of one resource | Inspect before modifying |
+| `terraform state mv` | Move/rename resource in state | Refactoring, splitting states |
+| `terraform state rm` | Remove resource from state (NOT from AWS) | Orphaned resources, unmanage |
+| `terraform state pull` | Download remote state to stdout | Backup, inspection |
+| `terraform state push` | Upload state to remote backend | Restore from backup |
+| `terraform state replace-provider` | Change provider in state | Provider migration |
+
+#### Scenario 1: Remove Phantom Resources (exist in state but NOT in AWS)
+
+```bash
+# Step 1: Identify the problem
+terraform plan
+# Output:
+# Error: reading EC2 Instance (i-0abc123): couldn't find resource
+# Error: reading EC2 Instance (i-0def456): couldn't find resource
+# Error: reading EC2 Instance (i-0ghi789): couldn't find resource
+
+# Step 2: Verify they're really gone from AWS
+aws ec2 describe-instances --instance-ids i-0abc123 i-0def456 i-0ghi789
+# "InvalidInstanceID.NotFound"
+
+# Step 3: Remove from state (does NOT try to delete from AWS)
+terraform state rm 'aws_instance.app["web-1"]'
+terraform state rm 'aws_instance.app["web-2"]'
+terraform state rm 'aws_instance.app["web-3"]'
+
+# Step 4: Verify clean plan
+terraform plan
+# "No changes. Your infrastructure matches the configuration."
+
+# Step 5: Also remove the resource blocks from your .tf files
+# or Terraform will try to CREATE new ones
+```
+
+#### Scenario 2: Move Resources Between State Files
+
+```bash
+# Moving VPC resources from "app-infra" state to new "networking" state
+
+# Step 1: List what needs to move
+cd environments/prod/app-infra
+terraform state list | grep -E "vpc|subnet|nat|igw|route_table"
+# Output:
+# aws_vpc.main
+# aws_subnet.private["ap-south-1a"]
+# aws_subnet.private["ap-south-1b"]
+# aws_subnet.public["ap-south-1a"]
+# aws_nat_gateway.main
+# aws_internet_gateway.main
+# aws_route_table.private
+# aws_route_table.public
+
+# Step 2: Pull current state as backup
+terraform state pull > backup-app-infra-$(date +%Y%m%d).tfstate
+
+# Step 3: Move resources to the new state
+# First, initialize the new networking config
+cd environments/prod/networking
+terraform init
+
+# Step 4: Use terraform state mv with -state-out (move between states)
+cd environments/prod/app-infra
+
+terraform state mv \
+  -state-out=../networking/terraform.tfstate \
+  aws_vpc.main aws_vpc.main
+
+terraform state mv \
+  -state-out=../networking/terraform.tfstate \
+  'aws_subnet.private["ap-south-1a"]' 'aws_subnet.private["ap-south-1a"]'
+
+terraform state mv \
+  -state-out=../networking/terraform.tfstate \
+  'aws_subnet.private["ap-south-1b"]' 'aws_subnet.private["ap-south-1b"]'
+
+terraform state mv \
+  -state-out=../networking/terraform.tfstate \
+  aws_nat_gateway.main aws_nat_gateway.main
+
+# Step 5: Push the new state to remote backend
+cd environments/prod/networking
+terraform state push terraform.tfstate
+
+# Step 6: Verify BOTH states
+cd environments/prod/app-infra
+terraform plan    # Should not try to recreate VPC resources
+
+cd environments/prod/networking
+terraform plan    # Should show "No changes"
+```
+
+#### Scenario 3: Rename a Resource in State
+
+```bash
+# Rename without moved blocks (older Terraform)
+terraform state mv aws_instance.server1 aws_instance.web_server
+
+# Rename a module
+terraform state mv module.old_name module.new_name
+
+# Rename a resource inside a module
+terraform state mv \
+  module.app.aws_instance.main \
+  module.app.aws_instance.primary
+```
+
+#### Scenario 4: Disaster Recovery — Restore Corrupted State
+
+```bash
+# Step 1: Pull the last known good state from S3 versioning
+aws s3api list-object-versions \
+  --bucket mycompany-terraform-state \
+  --prefix prod/app/terraform.tfstate \
+  --query "Versions[0:5].[VersionId,LastModified,Size]" --output table
+
+# Step 2: Download a specific version
+aws s3api get-object \
+  --bucket mycompany-terraform-state \
+  --key prod/app/terraform.tfstate \
+  --version-id "v3rsion1d_good" \
+  good-state.tfstate
+
+# Step 3: Verify it's valid JSON
+python -m json.tool good-state.tfstate > /dev/null && echo "Valid" || echo "Corrupted"
+
+# Step 4: Force-unlock if locked
+terraform force-unlock LOCK-ID-HERE
+
+# Step 5: Push the good state
+terraform state push good-state.tfstate
+
+# Step 6: Run plan to check alignment
+terraform plan
+```
+
+#### Scenario 5: Unmanage a Resource (stop managing without deleting)
+
+```bash
+# You want Terraform to "forget" about an RDS instance
+# (maybe another team will manage it manually or with a different tool)
+
+# Step 1: Remove from state
+terraform state rm aws_db_instance.legacy_db
+# "Successfully removed 1 resource instance(s)."
+
+# Step 2: Remove from .tf code
+# Delete the resource block from your .tf files
+
+# Step 3: The RDS instance is still running in AWS — untouched
+# Terraform just doesn't know about it anymore
+
+# WARNING: If you DON'T remove the resource block from .tf,
+# Terraform will try to CREATE a new RDS instance with the same config
+```
+
+---
+
+## Q18. Terraform Conditional Logic and Expressions
+
+### Question
+
+> You need to create resources conditionally — for example, NAT Gateways only in prod (not dev), CloudWatch alarms only when monitoring is enabled, and different instance types per environment. How do you implement conditional resource creation, conditional attributes, and complex conditional logic in Terraform?
+
+### Real-Life Scenario
+
+Your dev environment costs $5,000/month because it has the same NAT Gateways, Multi-AZ RDS, and CloudFront distribution as production. The finance team demands cost reduction. You need to conditionally skip expensive resources in dev while keeping the same codebase.
+
+### Answer
+
+#### Pattern 1: Conditional Resource Creation with `count`
+
+```hcl
+variable "environment" {
+  type = string   # "dev", "staging", "prod"
+}
+
+# NAT Gateway — only in staging and prod (costs ~$32/month + data transfer)
+resource "aws_nat_gateway" "main" {
+  count         = var.environment != "dev" ? 1 : 0
+  allocation_id = aws_eip.nat[0].id
+  subnet_id     = aws_subnet.public[0].id
+}
+
+resource "aws_eip" "nat" {
+  count  = var.environment != "dev" ? 1 : 0
+  domain = "vpc"
+}
+
+# Reference conditionally created resources:
+resource "aws_route" "private_nat" {
+  count                  = var.environment != "dev" ? 1 : 0
+  route_table_id         = aws_route_table.private.id
+  destination_cidr_block = "0.0.0.0/0"
+  nat_gateway_id         = aws_nat_gateway.main[0].id   # [0] because count was used
+}
+```
+
+#### Pattern 2: Conditional Resource with `for_each` and Empty Map
+
+```hcl
+# CloudWatch Alarms — only when monitoring is enabled
+variable "enable_monitoring" {
+  type    = bool
+  default = true
+}
+
+variable "alarms" {
+  type = map(object({
+    metric_name = string
+    threshold   = number
+  }))
+  default = {
+    "high-cpu" = { metric_name = "CPUUtilization", threshold = 80 }
+    "high-mem" = { metric_name = "MemoryUtilization", threshold = 85 }
+  }
+}
+
+resource "aws_cloudwatch_metric_alarm" "this" {
+  for_each = var.enable_monitoring ? var.alarms : {}   # Empty map = no resources
+
+  alarm_name  = "${var.environment}-${each.key}"
+  metric_name = each.value.metric_name
+  threshold   = each.value.threshold
+  # ...
+}
+```
+
+#### Pattern 3: Conditional Attributes with Ternary
+
+```hcl
+resource "aws_db_instance" "main" {
+  identifier     = "${var.environment}-db"
+  engine         = "postgres"
+  engine_version = "16.3"
+
+  # Prod: m5.xlarge, Dev: t3.micro
+  instance_class = var.environment == "prod" ? "db.r6g.xlarge" : "db.t3.micro"
+
+  # Prod: Multi-AZ, Dev: Single-AZ
+  multi_az = var.environment == "prod" ? true : false
+
+  # Prod: 1000 GB, Dev: 20 GB
+  allocated_storage = var.environment == "prod" ? 1000 : 20
+
+  # Prod: gp3 with 3000 IOPS, Dev: gp2
+  storage_type = var.environment == "prod" ? "gp3" : "gp2"
+  iops         = var.environment == "prod" ? 3000 : null   # null = use default
+
+  # Deletion protection only in prod
+  deletion_protection = var.environment == "prod"
+
+  # Backup retention: prod = 35 days, dev = 1 day
+  backup_retention_period = var.environment == "prod" ? 35 : 1
+}
+```
+
+#### Pattern 4: Locals for Complex Conditional Logic
+
+```hcl
+locals {
+  # Environment-specific configuration map
+  env_config = {
+    dev = {
+      instance_type    = "t3.medium"
+      min_size         = 1
+      max_size         = 2
+      enable_nat       = false
+      enable_waf       = false
+      enable_cloudfront = false
+      rds_multi_az     = false
+    }
+    staging = {
+      instance_type    = "m5.large"
+      min_size         = 2
+      max_size         = 4
+      enable_nat       = true
+      enable_waf       = true
+      enable_cloudfront = false
+      rds_multi_az     = false
+    }
+    prod = {
+      instance_type    = "m5.xlarge"
+      min_size         = 3
+      max_size         = 10
+      enable_nat       = true
+      enable_waf       = true
+      enable_cloudfront = true
+      rds_multi_az     = true
+    }
+  }
+
+  # Select current environment config
+  config = local.env_config[var.environment]
+}
+
+# Usage — clean and readable
+resource "aws_autoscaling_group" "app" {
+  min_size         = local.config.min_size
+  max_size         = local.config.max_size
+  # ...
+}
+
+resource "aws_nat_gateway" "main" {
+  count = local.config.enable_nat ? 1 : 0
+  # ...
+}
+```
+
+#### Pattern 5: Conditional Dynamic Blocks
+
+```hcl
+resource "aws_launch_template" "app" {
+  name          = "${var.environment}-app"
+  image_id      = data.aws_ami.latest.id
+  instance_type = local.config.instance_type
+
+  # Add detailed monitoring block only in prod
+  dynamic "monitoring" {
+    for_each = var.environment == "prod" ? [1] : []
+    content {
+      enabled = true
+    }
+  }
+
+  # Add placement group only in prod
+  dynamic "placement" {
+    for_each = var.environment == "prod" ? [1] : []
+    content {
+      group_name = aws_placement_group.app[0].name
+    }
+  }
+}
+```
+
+#### Cost Comparison After Optimization
+
+| Resource | Dev (Before) | Dev (After) | Monthly Savings |
+|----------|-------------|-------------|-----------------|
+| NAT Gateway | $32 + data | $0 (removed) | $32+ |
+| RDS Multi-AZ | $400 | $15 (t3.micro, single-AZ) | $385 |
+| CloudFront | $50 | $0 (removed) | $50 |
+| EC2 (m5.xlarge×3) | $410 | $30 (t3.medium×1) | $380 |
+| WAF | $10 | $0 (removed) | $10 |
+| **Total** | **~$900** | **~$45** | **~$855/month** |
+
+---
+
+## Q19. Terraform `depends_on` — Explicit vs Implicit Dependencies
+
+### Question
+
+> Terraform usually handles dependencies automatically. But sometimes `terraform apply` fails because resources are created in the wrong order. When do you need explicit `depends_on`, and when does it cause more problems than it solves? Show a real scenario where missing `depends_on` causes a failure and one where using it incorrectly causes slowness.
+
+### Real-Life Scenario
+
+You're creating an EKS cluster, and `terraform apply` fails because the IAM role policy attachment hasn't propagated yet when EKS tries to use the role. The error is "InvalidParameterException: The role does not have sufficient permissions." Adding `depends_on` fixes it — but then you start adding `depends_on` everywhere "just to be safe," and your apply time doubles because resources that could be parallel are now serial.
+
+### Answer
+
+#### Implicit Dependencies (Terraform Handles Automatically)
+
+```hcl
+# Terraform KNOWS the subnet needs the VPC first
+resource "aws_vpc" "main" {
+  cidr_block = "10.0.0.0/16"
+}
+
+resource "aws_subnet" "private" {
+  vpc_id     = aws_vpc.main.id      # ← Terraform sees this reference
+  cidr_block = "10.0.1.0/24"        #    and builds the dependency graph
+}
+
+# Order: VPC → Subnet (automatic, no depends_on needed)
+```
+
+```bash
+# Visualize the dependency graph
+terraform graph | dot -Tpng > graph.png
+# Or use:
+terraform graph -type=plan
+```
+
+#### When You NEED `depends_on`
+
+**Case 1: IAM Eventually Consistent (Most Common)**
+
+```hcl
+resource "aws_iam_role" "eks" {
+  name = "eks-cluster-role"
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect    = "Allow"
+      Principal = { Service = "eks.amazonaws.com" }
+      Action    = "sts:AssumeRole"
+    }]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "eks_cluster" {
+  role       = aws_iam_role.eks.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonEKSClusterPolicy"
+}
+
+resource "aws_eks_cluster" "main" {
+  name     = "production"
+  role_arn = aws_iam_role.eks.arn
+
+  # Without depends_on, Terraform creates the cluster immediately after the role
+  # But the policy attachment might not have propagated yet!
+  # Error: "The role does not have sufficient permissions"
+
+  depends_on = [
+    aws_iam_role_policy_attachment.eks_cluster    # Wait for policy to attach
+  ]
+
+  vpc_config {
+    subnet_ids = var.subnet_ids
+  }
+}
+```
+
+**Case 2: S3 Bucket Policy Before CloudFront Access**
+
+```hcl
+resource "aws_s3_bucket_policy" "cdn" {
+  bucket = aws_s3_bucket.static.id
+  policy = data.aws_iam_policy_document.cdn.json
+}
+
+resource "aws_cloudfront_distribution" "main" {
+  # CloudFront tries to access S3, but policy might not be ready
+  depends_on = [aws_s3_bucket_policy.cdn]
+
+  origin {
+    domain_name = aws_s3_bucket.static.bucket_regional_domain_name
+    origin_id   = "s3-static"
+  }
+  # ...
+}
+```
+
+**Case 3: VPC Endpoints Before Lambda in VPC**
+
+```hcl
+resource "aws_vpc_endpoint" "s3" {
+  vpc_id       = aws_vpc.main.id
+  service_name = "com.amazonaws.ap-south-1.s3"
+}
+
+resource "aws_lambda_function" "app" {
+  function_name = "my-app"
+  role          = aws_iam_role.lambda.arn
+  handler       = "index.handler"
+  runtime       = "nodejs18.x"
+
+  vpc_config {
+    subnet_ids         = aws_subnet.private[*].id
+    security_group_ids = [aws_security_group.lambda.id]
+  }
+
+  # Lambda needs the VPC endpoint to access S3
+  depends_on = [aws_vpc_endpoint.s3]
+}
+```
+
+#### When `depends_on` is WRONG (Causes Problems)
+
+```hcl
+# ❌ WRONG — Unnecessary depends_on slows everything down
+resource "aws_instance" "web" {
+  ami           = "ami-abc123"
+  instance_type = "m5.large"
+  subnet_id     = aws_subnet.private[0].id
+
+  depends_on = [
+    aws_vpc.main,               # Already implicit via subnet
+    aws_subnet.private,         # Already implicit via subnet_id reference
+    aws_security_group.web,     # Add this to vpc_security_group_ids instead
+    aws_iam_role.app,           # Unrelated — forces serial execution
+    aws_s3_bucket.logs,         # Unrelated — forces serial execution
+  ]
+}
+
+# ✅ CORRECT — Let Terraform figure out dependencies
+resource "aws_instance" "web" {
+  ami                    = "ami-abc123"
+  instance_type          = "m5.large"
+  subnet_id              = aws_subnet.private[0].id
+  vpc_security_group_ids = [aws_security_group.web.id]   # Implicit dependency
+  iam_instance_profile   = aws_iam_instance_profile.app.name  # Implicit dependency
+}
+```
+
+#### Module-Level `depends_on`
+
+```hcl
+# Sometimes you need a whole module to wait for another
+module "eks" {
+  source = "./modules/eks"
+  # ...
+
+  depends_on = [
+    module.vpc,                    # All VPC resources must exist first
+    aws_iam_role_policy_attachment.eks_policies   # IAM must propagate
+  ]
+}
+```
+
+#### Debugging Dependency Issues
+
+```bash
+# See what Terraform thinks the dependencies are
+terraform graph -type=plan | grep -A2 "aws_eks_cluster"
+
+# Verbose logging during apply
+TF_LOG=DEBUG terraform apply 2>&1 | grep -i "depend"
+
+# If a resource fails due to missing dependency:
+# 1. Check if the error is about permissions → IAM propagation → add depends_on
+# 2. Check if the error is "not found" → resource reference missing → use attribute reference
+# 3. Check if the error is timing → use depends_on as last resort
+```
+
+---
+
+## Q20. Terraform Providers — Custom Providers, Version Pinning, and Mirror Registries
+
+### Question
+
+> Your organization has strict security requirements: no direct internet access from CI/CD runners, all Terraform providers must be pre-approved and scanned, and you need to use a custom provider for an internal tool. How do you set up a provider mirror/cache, pin provider versions, and create a custom provider? What happens when a provider version has a breaking change?
+
+### Real-Life Scenario
+
+Your CI/CD pipeline suddenly fails one Monday because HashiCorp released AWS provider v6.0.0 with breaking changes, and your config didn't pin the version. Meanwhile, your air-gapped production environment can't download providers from the internet at all.
+
+### Answer
+
+#### Step 1: Version Pinning (ALWAYS Do This)
+
+```hcl
+# versions.tf
+terraform {
+  required_version = ">= 1.5.0, < 2.0.0"   # Pin Terraform itself
+
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.40"    # Allows 5.40.x, 5.41.x but NOT 6.0.0
+    }
+    kubernetes = {
+      source  = "hashicorp/kubernetes"
+      version = "~> 2.27"
+    }
+    helm = {
+      source  = "hashicorp/helm"
+      version = "~> 2.12"
+    }
+  }
+}
+```
+
+**Version constraint syntax:**
+
+```
+"= 5.40.0"     Exact version only
+"~> 5.40"       >= 5.40.0, < 6.0.0 (recommended for major protection)
+"~> 5.40.0"     >= 5.40.0, < 5.41.0 (very strict)
+">= 5.40"       5.40 or higher (dangerous — allows 6.0!)
+">= 5.40, < 6"  Same as ~> 5.40
+```
+
+#### Step 2: Lock File (`.terraform.lock.hcl`)
+
+```bash
+# Terraform auto-generates this file
+terraform init
+
+# The lock file pins exact versions AND checksums:
+cat .terraform.lock.hcl
+```
+
+```hcl
+# .terraform.lock.hcl (COMMIT THIS TO GIT)
+provider "registry.terraform.io/hashicorp/aws" {
+  version     = "5.40.0"
+  constraints = "~> 5.40"
+  hashes = [
+    "h1:abc123...",     # Hash of the provider binary
+    "zh:def456...",
+  ]
+}
+```
+
+```bash
+# Update lock file when upgrading providers
+terraform init -upgrade
+
+# Verify lock file hasn't been tampered with
+terraform providers lock \
+  -platform=linux_amd64 \
+  -platform=darwin_amd64 \
+  -platform=windows_amd64
+```
+
+#### Step 3: Provider Mirror for Air-Gapped Environments
+
+```bash
+# Option A: Filesystem Mirror
+# Download providers on a machine WITH internet
+terraform providers mirror /opt/terraform/providers
+
+# Directory structure created:
+/opt/terraform/providers/
+└── registry.terraform.io/
+    └── hashicorp/
+        ├── aws/
+        │   └── 5.40.0/
+        │       ├── terraform-provider-aws_5.40.0_linux_amd64.zip
+        │       └── terraform-provider-aws_5.40.0_darwin_amd64.zip
+        └── kubernetes/
+            └── 2.27.0/
+                └── ...
+
+# Copy this directory to air-gapped servers via USB/S3/internal network
+```
+
+```hcl
+# CLI config on air-gapped servers: ~/.terraformrc
+provider_installation {
+  filesystem_mirror {
+    path    = "/opt/terraform/providers"
+    include = ["registry.terraform.io/*/*"]
+  }
+
+  # Fallback to direct (only if allowed)
+  # direct {
+  #   exclude = []
+  # }
+}
+```
+
+```bash
+# Option B: Network Mirror (internal HTTP server)
+# Host a mirror on your internal Artifactory/Nexus
+
+# ~/.terraformrc
+provider_installation {
+  network_mirror {
+    url = "https://artifactory.mycompany.com/terraform-providers/"
+  }
+}
+```
+
+#### Step 4: Artifactory/Nexus as Provider Registry
+
+```bash
+# JFrog Artifactory setup:
+# 1. Create a "terraform" remote repository pointing to registry.terraform.io
+# 2. Create a virtual repository combining remote + local
+# 3. Configure Terraform to use it:
+
+# ~/.terraformrc
+provider_installation {
+  network_mirror {
+    url = "https://artifactory.mycompany.com/api/terraform/providers/v1/"
+  }
+}
+
+# Approval workflow:
+# 1. Security team scans new provider version
+# 2. If approved, promote to "approved" repo
+# 3. CI/CD only uses "approved" repo
+```
+
+#### Step 5: Custom Provider (for internal tools)
+
+```go
+// internal/provider/provider.go (Go code — Terraform SDK v2)
+package provider
+
+import (
+    "github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
+)
+
+func Provider() *schema.Provider {
+    return &schema.Provider{
+        Schema: map[string]*schema.Schema{
+            "api_endpoint": {
+                Type:        schema.TypeString,
+                Required:    true,
+                DefaultFunc: schema.EnvDefaultFunc("MYCOMPANY_API_URL", nil),
+            },
+        },
+        ResourcesMap: map[string]*schema.Resource{
+            "mycompany_database":    resourceDatabase(),
+            "mycompany_application": resourceApplication(),
+        },
+    }
+}
+```
+
+```bash
+# Build and install custom provider
+go build -o terraform-provider-mycompany
+mkdir -p ~/.terraform.d/plugins/mycompany.com/internal/mycompany/1.0.0/linux_amd64/
+cp terraform-provider-mycompany ~/.terraform.d/plugins/mycompany.com/internal/mycompany/1.0.0/linux_amd64/
+```
+
+```hcl
+# Use in Terraform
+terraform {
+  required_providers {
+    mycompany = {
+      source  = "mycompany.com/internal/mycompany"
+      version = "1.0.0"
+    }
+  }
+}
+
+provider "mycompany" {
+  api_endpoint = "https://internal-api.mycompany.com"
+}
+
+resource "mycompany_database" "app" {
+  name   = "production-db"
+  engine = "postgres"
+}
+```
+
+#### Handling Provider Breaking Changes
+
+```bash
+# Monday morning: CI/CD fails after provider update
+
+# Step 1: Check what changed
+terraform version
+# Terraform v1.7.0
+# + provider registry.terraform.io/hashicorp/aws v6.0.0   ← Breaking!
+
+# Step 2: Roll back by pinning version in versions.tf
+# version = "~> 5.40"    ← This would have prevented the issue
+
+# Step 3: Delete lock file and reinit
+rm .terraform.lock.hcl
+rm -rf .terraform/
+terraform init
+
+# Step 4: Read the upgrade guide
+# https://registry.terraform.io/providers/hashicorp/aws/latest/docs/guides/version-6-upgrade
+
+# Step 5: Make changes required by v6.0, test in dev first
+# Common breaking changes:
+# - Removed deprecated attributes
+# - Changed attribute types
+# - Renamed resources
+# - Changed default values
+```
+
+#### Troubleshooting
+
+```bash
+# Problem: "Could not retrieve the list of available versions"
+# CI/CD can't reach registry.terraform.io
+# Solution: Set up a network mirror or filesystem mirror
+
+# Problem: "Inconsistent dependency lock file"
+# Lock file doesn't match required version constraints
+terraform init -upgrade
+
+# Problem: "Failed to query available provider packages"
+# Wrong source address in required_providers
+terraform providers
+# Shows which providers are required and from where
+
+# Problem: "Provider version not available on your platform"
+# You're on ARM Mac but provider only has amd64 builds
+terraform providers lock -platform=darwin_arm64
 ```
 
 ---
